@@ -1,0 +1,170 @@
+use reqwest::blocking::{Client, Response};
+use reqwest::Method;
+use std::collections::HashMap;
+use std::io::{self, Write};
+
+#[derive(Debug)]
+struct Request {
+    name: String,
+    method: Method,
+    url: String,
+    headers: HashMap<String, String>,
+    body: Option<String>,
+}
+
+fn main() {
+    let mut requests: Vec<Request> = Vec::new();
+    let client = Client::new();
+
+    loop {
+        println!("\n--- Postman CLI ---");
+        println!("1. Listar requisições");
+        println!("2. Criar nova requisição");
+        println!("3. Executar uma requisição");
+        println!("4. Sair");
+        print!("Escolha uma opção: ");
+        io::stdout().flush().unwrap();
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice).unwrap();
+        match choice.trim() {
+            "1" => list_requests(&requests),
+            "2" => create_request(&mut requests),
+            "3" => execute_request(&requests, &client),
+            "4" => {
+                println!("Saindo...");
+                break;
+            }
+            _ => println!("Opção inválida! Tente novamente."),
+        }
+    }
+}
+
+fn list_requests(requests: &[Request]) {
+    if requests.is_empty() {
+        println!("Nenhuma requisição criada.");
+        return;
+    }
+    for (i, req) in requests.iter().enumerate() {
+        println!("{}: [{}] {} {}", i + 1, req.name, req.method, req.url);
+    }
+}
+
+fn create_request(requests: &mut Vec<Request>) {
+    let mut name = String::new();
+    let mut method = String::new();
+    let mut url = String::new();
+    let mut headers = HashMap::new();
+    let mut body = String::new();
+
+    print!("Nome da requisição: ");
+    io::stdout().flush().unwrap();
+    io::stdin().read_line(&mut name).unwrap();
+
+    print!("Método (GET, POST, PUT, DELETE, etc.): ");
+    io::stdout().flush().unwrap();
+    io::stdin().read_line(&mut method).unwrap();
+
+    print!("URL: ");
+    io::stdout().flush().unwrap();
+    io::stdin().read_line(&mut url).unwrap();
+
+    loop {
+        print!("Adicionar cabeçalho? (s/n): ");
+        io::stdout().flush().unwrap();
+        let mut add_header = String::new();
+        io::stdin().read_line(&mut add_header).unwrap();
+
+        if add_header.trim().eq_ignore_ascii_case("n") {
+            break;
+        }
+
+        let mut header_key = String::new();
+        let mut header_value = String::new();
+
+        print!("Chave: ");
+        io::stdout().flush().unwrap();
+        io::stdin().read_line(&mut header_key).unwrap();
+
+        print!("Valor: ");
+        io::stdout().flush().unwrap();
+        io::stdin().read_line(&mut header_value).unwrap();
+
+        headers.insert(
+            header_key.trim().to_string(),
+            header_value.trim().to_string(),
+        );
+    }
+
+    if method.trim().eq_ignore_ascii_case("POST") || method.trim().eq_ignore_ascii_case("PUT") {
+        print!("Corpo da requisição (JSON): ");
+        io::stdout().flush().unwrap();
+        io::stdin().read_line(&mut body).unwrap();
+    }
+
+    requests.push(Request {
+        name: name.trim().to_string(),
+        method: method.trim().parse().unwrap_or(Method::GET),
+        url: url.trim().to_string(),
+        headers,
+        body: if body.trim().is_empty() {
+            None
+        } else {
+            Some(body.trim().to_string())
+        },
+    });
+
+    println!("Requisição criada com sucesso!");
+}
+
+fn execute_request(requests: &[Request], client: &Client) {
+    if requests.is_empty() {
+        println!("Nenhuma requisição disponível para executar.");
+        return;
+    }
+
+    println!("Selecione o número da requisição para executar:");
+    list_requests(requests);
+
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice).unwrap();
+    let index: usize = match choice.trim().parse() {
+        Ok(num) => num,
+        Err(_) => {
+            println!("Entrada inválida.");
+            return;
+        }
+    };
+
+    if index == 0 || index > requests.len() {
+        println!("Requisição inválida.");
+        return;
+    }
+
+    let request = &requests[index - 1];
+    let mut req_builder = client.request(request.method.clone(), &request.url);
+
+    for (key, value) in &request.headers {
+        req_builder = req_builder.header(key, value);
+    }
+
+    if let Some(body) = &request.body {
+        req_builder = req_builder.body(body.clone());
+    }
+
+    println!("\nExecutando requisição...");
+    match req_builder.send() {
+        Ok(response) => display_response(response),
+        Err(e) => println!("Erro ao executar a requisição: {}", e),
+    }
+}
+
+fn display_response(response: Response) {
+    println!("Status: {}", response.status());
+    println!("Headers: {:?}", response.headers());
+
+    match response.text() {
+        Ok(text) => println!("Body: {}", text),
+        Err(e) => println!("Erro ao ler o corpo da resposta: {}", e),
+    }
+}
