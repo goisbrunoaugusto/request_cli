@@ -1,0 +1,24 @@
+Minha Requisição GET
+GET
+https://httpbin.org/get
+header: Y
+Accept: application/json
+body: N
++
+Exemplo POST
+POST
+https://httpbin.org/post
+header: Y
+Content-Type: application/json
+User-Agent: PostmanCLI
+body: Y
+{
+  "teste": 123,
+  "mensagem": "Olá!"
+}
++
+Delete sem cabeçalho
+DELETE
+https://httpbin.org/delete
+header: N
+body: N
