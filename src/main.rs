@@ -6,11 +6,59 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
+use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use serde_json::to_string;
+use crate::loader::{load_requests_from_txt, Request as LoaderRequest};
 
 
-fn main() {
+let loaded_requests: Vec<LoaderRequest> = load_requests_from_txt(path)?;
+requests.extend(loaded_requests.into_iter().map(|r| Request {
+    name: r.name,
+    method: r.method,
+    url: r.url,
+    headers: r.headers,
+    body: r.body,
+}));
+
+async fn init_db() -> Result<Pool<Sqlite>, sqlx::Error> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect("sqlite://requests.db")
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS request_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            method TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT,
+            body TEXT,
+            status_code INTEGER,
+            response_body TEXT,
+            executed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    Ok(pool)
+}
+
+#[tokio::main]
+async fn main() {
     let mut requests: Vec<Request> = Vec::new();
     let client = Client::new();
+
+    let pool = match init_db().await {
+        Ok(pool) => pool,
+        Err(e) => {
+            println!("Erro ao inicializar o banco de dados: {}", e);
+            return;
+        }
+    };
 
     println!(
 r#" __  __     ______   ______   ______     ______     __    __     __     __   __     ______     __        
@@ -29,7 +77,8 @@ r#" __  __     ______   ______   ______     ______     __    __     __     __   
         println!("3. Executar uma requisição");
         println!("4. Executar uma requisição e exportar resultado");
         println!("5. Carregar requisições de um arquivo");
-        println!("6. Sair");
+        println!("6. Ver histórico de requisições");
+        println!("7. Sair");
         print!("Escolha uma opção: ");
         io::stdout().flush().unwrap();
 
@@ -42,10 +91,11 @@ r#" __  __     ______   ______   ______     ______     __    __     __     __   
         match choice.trim() {
             "1" => list_requests(&requests),
             "2" => create_request(&mut requests),
-            "3" => execute_request(&requests, &client),
+            "3" => execute_request(&requests, &client, &pool).await,
             "4" => execute_and_export_request(&requests, &client),
             "5" => load_from_file(&mut requests),
-            "6" => {
+            "6" => list_request_history(&pool).await,
+            "7" => {
                 println!("Saindo...");
                 break;
             }
@@ -150,7 +200,11 @@ fn execute_single_request(client: &Client, request: &Request)
     Ok(format!("Status: {}\nBody:\n{}", status, text))
 }
 
-fn execute_request(requests: &[Request], client: &Client) {
+async fn execute_request(
+    requests: &[Request],
+    client: &Client,
+    pool: &Pool<Sqlite>,
+) {
     if requests.is_empty() {
         println!("Nenhuma requisição disponível para executar.");
         return;
@@ -175,22 +229,34 @@ fn execute_request(requests: &[Request], client: &Client) {
     }
 
     let request = &requests[index - 1];
-    let mut req_builder = client.request(request.method.clone(), &request.url);
+    match execute_single_request(client, request) {
+        Ok(response_text) => {
+            println!("{}", response_text);
 
-    for (key, value) in &request.headers {
-        req_builder = req_builder.header(key, value);
-    }
-
-    if let Some(body) = &request.body {
-        req_builder = req_builder.body(body.clone());
-    }
-
-    println!("\nExecutando requisição...");
-    match req_builder.send() {
-        Ok(response) => display_response(response),
-        Err(e) => println!("Erro ao executar a requisição: {}", e),
+            if let Some(status_code) = response_text
+                .lines()
+                .find(|line| line.contains("Status:"))
+                .and_then(|line| line.split(' ').nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+            {
+                save_request_to_db(
+                    pool,
+                    &request.name,
+                    &request.method.to_string(),
+                    &request.url,
+                    &request.headers,
+                    request.body.as_ref(),
+                    status_code,
+                    &response_text,
+                )
+                .await
+                .unwrap_or_else(|err| println!("Erro ao salvar no banco: {}", err));
+            }
+        }
+        Err(err) => println!("Erro ao executar a requisição: {}", err),
     }
 }
+
 
 fn execute_and_export_request(requests: &[Request], client: &Client) {
     if requests.is_empty() {
@@ -282,5 +348,61 @@ fn display_response(response: Response) {
     match response.text() {
         Ok(text) => println!("Body: {}", text),
         Err(e) => println!("Erro ao ler o corpo da resposta: {}", e),
+    }
+}
+
+async fn save_request_to_db(
+    pool: &Pool<Sqlite>,
+    name: &str,
+    method: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    body: Option<&String>,
+    status_code: u16,
+    response_body: &str,
+) -> Result<(), sqlx::Error> {
+    let headers_json = to_string(&headers).unwrap_or_default();
+    let body = body.unwrap_or(&String::new());
+
+    sqlx::query!(
+        r#"
+        INSERT INTO request_history (name, method, url, headers, body, status_code, response_body)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+        name,
+        method,
+        url,
+        headers_json,
+        body,
+        status_code,
+        response_body
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn list_request_history(pool: &Pool<Sqlite>) {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, name, method, url, status_code, executed_at
+        FROM request_history
+        ORDER BY executed_at DESC
+        "#
+    )
+    .fetch_all(pool)
+    .await;
+
+    match rows {
+        Ok(requests) => {
+            for request in requests {
+                println!(
+                    "[{}] {} {} {} -> Status: {}",
+                    request.executed_at, request.id, request.method, request.url, request.status_code
+                );
+            }
+        }
+        Err(err) => println!("Erro ao recuperar histórico: {}", err),
     }
 }
