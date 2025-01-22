@@ -1,5 +1,7 @@
 mod loader;
+mod database;
 
+use crate::database::Database;
 use crate::loader::{load_requests_from_txt, Request};
 use reqwest::blocking::{Client, Response};
 use reqwest::Method;
@@ -9,8 +11,9 @@ use std::io::{self, Write};
 
 
 fn main() {
-    let mut requests: Vec<Request> = Vec::new();
+    let mut db = Database::new("request_db").expect("Erro ao inicializar o banco de dados");
     let client = Client::new();
+    let mut requests: Vec<Request> = Vec::new();
 
     println!(
 r#" __  __     ______   ______   ______     ______     __    __     __     __   __     ______     __        
@@ -29,23 +32,26 @@ r#" __  __     ______   ______   ______     ______     __    __     __     __   
         println!("3. Executar uma requisição");
         println!("4. Executar uma requisição e exportar resultado");
         println!("5. Carregar requisições de um arquivo");
-        println!("6. Sair");
+        println!("6. Salvar requisiões de um endpoint no banco");
+        println!("7. Listar requisições salvas no banco");
+        println!("8. Excluir requisição do banco");
+        println!("9. Sair");
         print!("Escolha uma opção: ");
         io::stdout().flush().unwrap();
 
         let mut choice = String::new();
-        if io::stdin().read_line(&mut choice).is_err() {
-            println!("Erro ao ler opção. Tente novamente.");
-            continue;
-        }
+        io::stdin().read_line(&mut choice).unwrap();
 
         match choice.trim() {
             "1" => list_requests(&requests),
             "2" => create_request(&mut requests),
-            "3" => execute_request(&requests, &client),
+            "3" => execute_request(&requests, &client, &db),
             "4" => execute_and_export_request(&requests, &client),
             "5" => load_from_file(&mut requests),
-            "6" => {
+            "6" => save_requests_to_db(&requests, &db),
+            "7" => list_saved_requests(&db),
+            "8" => manage_excluded_endpoints(&mut db),
+            "9" => {
                 println!("Saindo...");
                 break;
             }
@@ -150,7 +156,7 @@ fn execute_single_request(client: &Client, request: &Request)
     Ok(format!("Status: {}\nBody:\n{}", status, text))
 }
 
-fn execute_request(requests: &[Request], client: &Client) {
+fn execute_request(requests: &[Request], client: &Client, db: &Database) {
     if requests.is_empty() {
         println!("Nenhuma requisição disponível para executar.");
         return;
@@ -175,19 +181,17 @@ fn execute_request(requests: &[Request], client: &Client) {
     }
 
     let request = &requests[index - 1];
-    let mut req_builder = client.request(request.method.clone(), &request.url);
-
-    for (key, value) in &request.headers {
-        req_builder = req_builder.header(key, value);
-    }
-
-    if let Some(body) = &request.body {
-        req_builder = req_builder.body(body.clone());
-    }
-
     println!("\nExecutando requisição...");
-    match req_builder.send() {
-        Ok(response) => display_response(response),
+
+    match execute_single_request(client, request) {
+        Ok(response) => {
+            println!("Resposta:\n{}", response);
+            let status_line = response.lines().next().unwrap_or("");
+            let body = response.lines().skip(1).collect::<Vec<&str>>().join("\n");
+
+            db.save_request(request, status_line, &body)
+                .expect("Erro ao salvar a requisição no banco de dados.");
+        }
         Err(e) => println!("Erro ao executar a requisição: {}", e),
     }
 }
@@ -275,6 +279,7 @@ fn load_from_file(requests: &mut Vec<Request>) {
     }
 }
 
+#[allow(dead_code)]
 fn display_response(response: Response) {
     println!("Status: {}", response.status());
     println!("Headers: {:?}", response.headers());
@@ -282,5 +287,121 @@ fn display_response(response: Response) {
     match response.text() {
         Ok(text) => println!("Body: {}", text),
         Err(e) => println!("Erro ao ler o corpo da resposta: {}", e),
+    }
+}
+
+fn list_saved_requests(db: &Database) {
+    match db.list_requests() {
+        Ok(requests) => {
+            if requests.is_empty() {
+                println!("Nenhuma requisição salva no banco.");
+            } else {
+                for (key, value) in requests {
+                    println!("{}: {}", key, value);
+                }
+            }
+        }
+        Err(e) => println!("Erro ao listar requisições do banco: {}", e),
+    }
+}
+
+fn save_requests_to_db(requests: &[Request], db: &Database) {
+    if requests.is_empty() {
+        println!("Nenhuma requisição disponível para salvar no banco.");
+        return;
+    }
+
+    println!("Selecione o número da requisição para salvar no banco:");
+    list_requests(requests);
+
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice).unwrap();
+
+    let index: usize = match choice.trim().parse() {
+        Ok(num) => num,
+        Err(_) => {
+            println!("Entrada inválida.");
+            return;
+        }
+    };
+
+    if index == 0 || index > requests.len() {
+        println!("Requisição inválida.");
+        return;
+    }
+
+    let request = &requests[index - 1];
+    match db.save_request(request, "Não executado", "Sem resposta") {
+        Ok(_) => println!("Requisição '{}' salva no banco de dados.", request.name),
+        Err(e) => println!(
+            "Erro ao salvar a requisição '{}' no banco de dados: {}",
+            request.name, e
+        ),
+    }
+}
+
+fn manage_excluded_endpoints(db: &mut Database) {
+    // Obtenha as requisições salvas no banco
+    let requests = match db.list_requests() {
+        Ok(reqs) => reqs,
+        Err(e) => {
+            println!("Erro ao listar requisições salvas: {}", e);
+            return;
+        }
+    };
+
+    if requests.is_empty() {
+        println!("Nenhuma requisição salva no banco.");
+        return;
+    }
+
+    // Exibir requisições salvas com status de exclusão
+    println!("Requisições salvas no banco:");
+    for (i, (key, value)) in requests.iter().enumerate() {
+        let is_excluded = db.list_excluded_endpoints().contains(key);
+        println!("{}: {} [{}]", i + 1, value, if is_excluded { "Excluído" } else { "Incluído" });
+    }
+
+    // Escolha entre adicionar ou remover da lista de exclusão
+    println!("\n1. Adicionar requisição à lista de exclusão");
+    println!("2. Remover requisição da lista de exclusão");
+    println!("Escolha uma opção: ");
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice).unwrap();
+
+    match choice.trim() {
+        "1" => {
+            println!("Escolha o número da requisição para adicionar à lista de exclusão:");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            if let Ok(index) = input.trim().parse::<usize>() {
+                if index > 0 && index <= requests.len() {
+                    let (key, _) = &requests[index - 1];
+                    db.exclude_endpoint(key.clone());
+                    println!("Requisição '{}' adicionada à lista de exclusão.", key);
+                } else {
+                    println!("Opção inválida.");
+                }
+            } else {
+                println!("Entrada inválida.");
+            }
+        }
+        "2" => {
+            println!("Escolha o número da requisição para remover da lista de exclusão:");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            if let Ok(index) = input.trim().parse::<usize>() {
+                if index > 0 && index <= requests.len() {
+                    let (key, _) = &requests[index - 1];
+                    db.remove_excluded_endpoint(key);
+                    println!("Requisição '{}' removida da lista de exclusão.", key);
+                } else {
+                    println!("Opção inválida.");
+                }
+            } else {
+                println!("Entrada inválida.");
+            }
+        }
+        _ => println!("Opção inválida."),
     }
 }
